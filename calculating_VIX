@@ -1,0 +1,106 @@
+from datetime import datetime
+import numpy as np
+import pandas as pd
+from scipy.interpolate import griddata
+import time
+import os
+
+
+path = 'E:\暂时的东西\VIX_SKEW'
+os.chdir(path)
+option_data = pd.read_csv('options.csv')
+shibor = pd.read_csv('shibor_interst.csv')
+trade_date = pd.read_csv('tradeday.csv')
+
+
+def basic_inf(vix_date):
+    #获取计算VIX当天的所有期权
+    vix_option_data = option_data[option_data['trade_date'] == vix_date].reset_index(drop = True)
+    #找到期权所有的到期日
+    vix_enddate = sorted(vix_option_data['last_edate'].unique())
+    return vix_option_data,vix_enddate
+    
+
+#找到近月和次月的期权到期日
+def find_near_next_enddate(vix_date):
+    if (datetime.strptime(basic_inf(vix_date)[1][0],'%Y/%m/%d %H:%M').day-datetime.strptime(vix_date,'%Y/%m/%d').day) < 5:
+        near_term = 1
+        next_term = 2
+    else:
+        near_term = 0
+        next_term = 1
+    return near_term,next_term
+    
+
+#对现有的shibor利率期限结构进行插值，计算得到相应的shibor
+def vix_shibor(vix_date):
+    periods = []
+    for i in range(len(basic_inf(vix_date)[1])):
+        period = (datetime.strptime(basic_inf(vix_date)[1][i],'%Y/%m/%d %H:%M')-datetime.strptime(vix_date,'%Y/%m/%d')).days/365
+        periods.append(period)
+    #利用现有的shibor期限结构，插值求出剩余期限下的shibor
+    fixed_shibor = np.asarray(shibor[shibor['date'] == vix_date].values[0].tolist()[1:])
+    fixed_date = np.asarray([1, 7, 14, 30, 90, 180, 270, 360]) / 365
+    vix_shibor = griddata(fixed_date, fixed_shibor, np.asarray(periods), method = 'linear')/100
+    return vix_shibor,periods
+    
+    
+#获取远期价格F
+def future_price(option,shibor,tenor):
+    call = option[option['call_put'].isin(['C'])].sort_values(by = ['exe_price']).reset_index(drop = True)
+    put = option[option['call_put'].isin(['P'])].sort_values(by = ['exe_price']).reset_index(drop = True)
+    price_diff = abs(call['close']-put['close']).min()
+    strike = call.loc[abs(call['close']-put['close']).idxmin(),'exe_price']
+    future = strike + np.exp(shibor*tenor)*price_diff
+    return future
+    
+    
+#按照公式对期权的信进行处理
+def sigma_component(x):
+    return x['delta_K']*x['close']/(x['exe_price']**2)
+    
+    
+def cal_square(option,future,shibor,tenor):
+    #计算出离远期价格最近的行权价k0
+    k0 = option[option['exe_price'] < future].max()['exe_price']
+    #从K0隔开取出看涨和看跌虚值期权
+    call = option[(option['call_put'].isin(['C'])) & (option['exe_price'] > k0)].sort_values(by = ['exe_price']).reset_index(drop = True)
+    put = option[(option['call_put'].isin(['P'])) & (option['exe_price'] <= k0)].sort_values(by = ['exe_price']).reset_index(drop = True)
+    put.loc[len(put)-1,'close'] = option[option['exe_price'] == k0]['close'].sum()/2
+    otm_option = pd.concat([put,call]).reset_index(drop = True)
+    #计算delta_K
+    otm_option['delta_K'] = 0
+    otm_option.loc[0,'delta_K'] = otm_option.loc[1,'exe_price']-otm_option.loc[0,'exe_price']
+    otm_option.loc[len(otm_option)-1,'delta_K'] = otm_option.loc[len(otm_option)-1,'exe_price']-otm_option.loc[len(otm_option)-2,'exe_price']
+    for i in range(1,len(otm_option)-1):
+        otm_option.loc[i,'delta_K'] = (otm_option.loc[i+1,'exe_price']-otm_option.loc[i-1,'exe_price'])/2
+    sigma = otm_option.apply(lambda x:sigma_component(x),axis = 1).sum()*(np.exp(shibor*tenor))*(2/tenor)-(((future/k0)-1)**2)/tenor
+    return sigma
+    
+    
+ def ivix(vix_date):
+    #计算近月和次近月期权的剩余期限
+    near_tenor = vix_shibor(vix_date)[1][find_near_next_enddate(vix_date)[0]]
+    next_tenor = vix_shibor(vix_date)[1][find_near_next_enddate(vix_date)[1]]
+
+    #计算近月和次近月期权剩余期限对应下的利率
+    near_shibor = vix_shibor(vix_date)[0].tolist()[find_near_next_enddate(vix_date)[0]]
+    next_shibor = vix_shibor(vix_date)[0].tolist()[find_near_next_enddate(vix_date)[1]]
+
+    #获取近月和次近月的所有期权
+    near_option = basic_inf(vix_date)[0][basic_inf(vix_date)[0]['last_edate'] == basic_inf(vix_date)[1][find_near_next_enddate(vix_date)[0]]].reset_index(drop = True)
+    next_option = basic_inf(vix_date)[0][basic_inf(vix_date)[0]['last_edate'] == basic_inf(vix_date)[1][find_near_next_enddate(vix_date)[1]]].reset_index(drop = True)
+
+    #获取近月和次近月的远期价格F
+    near_future = future_price(near_option,near_shibor,near_tenor)
+    next_future = future_price(next_option,next_shibor,next_tenor)
+    
+    #获取近月和次近月期权的sigma
+    near_sigma = cal_square(near_option,near_future,near_shibor,near_tenor)
+    next_sigma = cal_square(next_option,next_future,next_shibor,next_tenor)
+    
+    ivix = np.sqrt((near_tenor*(near_sigma)*((next_tenor-30/365)/(next_tenor-near_tenor))+next_tenor*(next_sigma)*((30/365-near_tenor)/(next_tenor-near_tenor)))*(365/30))*100
+    return ivix
+    
+    
+ivix('2020/03/24')
